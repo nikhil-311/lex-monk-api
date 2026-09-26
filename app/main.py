@@ -36,6 +36,7 @@ app.add_middleware(
         "Content-Type",
         "X-WP-Bridge-Signature",
         "X-WP-Bridge-Timestamp",
+        "X-Lex-Monk-Session",
     ],
 )
 
@@ -164,15 +165,52 @@ def _verify_wp_signature(
         )
 
 
-def _current_user(
-    authorization: Optional[str] = Header(default=None),
-) -> dict[str, Any]:
-    if not authorization or not authorization.lower().startswith("bearer "):
+def _read_wordpress_session(token: str) -> dict[str, Any]:
+    """Read the short-lived session token issued by the WordPress plugin."""
+    try:
+        payload_b64, supplied_signature = token.split(".", 1)
+        expected_signature = _sign(payload_b64)
+        if not hmac.compare_digest(supplied_signature, expected_signature):
+            raise ValueError("invalid signature")
+
+        payload = json.loads(_b64url_decode(payload_b64))
+        if int(payload["exp"]) < int(time.time()):
+            raise ValueError("expired")
+
+        # WordPress plugin v2.x uses user_id instead of sub.
+        if not payload.get("user_id") or not payload.get("email"):
+            raise ValueError("invalid WordPress session payload")
+
+        return {
+            "sub": int(payload["user_id"]),
+            "email": payload["email"],
+            "name": payload.get("name", ""),
+            "premium": bool(payload.get("premium", False)),
+            "exp": int(payload["exp"]),
+        }
+    except Exception as exc:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Bearer access token required.",
-        )
-    return _read_session(authorization.split(" ", 1)[1].strip())
+            detail="Invalid or expired Lex Monk session.",
+        ) from exc
+
+
+def _current_user(
+    authorization: Optional[str] = Header(default=None),
+    lex_monk_session: Optional[str] = Header(default=None, alias="X-Lex-Monk-Session"),
+) -> dict[str, Any]:
+    # The WordPress integration plugin sends the session in this header.
+    if lex_monk_session:
+        return _read_wordpress_session(lex_monk_session)
+
+    # Also accept standard Bearer authentication for API clients.
+    if authorization and authorization.lower().startswith("bearer "):
+        return _read_session(authorization.split(" ", 1)[1].strip())
+
+    raise HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Lex Monk session required.",
+    )
 
 
 @app.get("/", response_model=HealthResponse)
